@@ -2,6 +2,7 @@
   Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:; style-src 'self' 'unsafe-inline'; connect-src 'self' https://huggingface.co https://*.huggingface.co https://*.hf.co https://cdn-lfs.hf.co https://cdn-lfs-us-1.hf.co wss: https:; worker-src 'self' blob:; img-src 'self' data: blob: https:; media-src 'self' blob: https:; font-src 'self' data: https:; frame-src 'self' blob:
   Cross-Origin-Opener-Policy: same-origin
   Cross-Origin-Embedder-Policy: credentialless
+  Referrer-Policy: same-origin
 
 /assets/*
   cache-control: max-age=31536000
