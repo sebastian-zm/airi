@@ -1,42 +1,29 @@
 /**
- * Background removal Web Worker.
+ * Background removal Web Worker entry point.
  *
  * Runs the Xenova/modnet model inference off the main thread.
- * Uses the unified inference protocol from protocol.ts.
+ * Speaks the Eventa inference contract (see `libs/inference/contract.ts`):
+ * load is a server-streaming invoke (download progress chunks then a terminal
+ * `ready`); process is a unary invoke that transfers the raw mask buffer back
+ * zero-copy.
  */
 
 import type { PreTrainedModel, Processor } from '@huggingface/transformers'
 
-import type {
-  ErrorResponse,
-  InferenceResultResponse,
-  LoadModelRequest,
-  ModelReadyResponse,
-  ProgressResponse,
-  RunInferenceRequest,
-  WorkerInboundMessage,
-} from '../../libs/inference/protocol'
+import type { InferenceDevice, LoadModelRequest, LoadStreamItem } from '../../libs/inference/contract'
 
 import { AutoModel, AutoProcessor, env, RawImage } from '@huggingface/transformers'
+import { defineInvokeHandler, defineStreamInvokeHandler, toStreamHandler, withTransfer } from '@moeru/eventa'
+import { createContext } from '@moeru/eventa/adapters/webworkers/worker'
 
-import { MODEL_IDS, MODEL_NAMES } from '../../libs/inference/constants'
-import { classifyError, isRecoverable } from '../../libs/inference/protocol'
+import { MODEL_IDS } from '../../libs/inference/constants'
+import {
+  backgroundRemovalLoadEvent,
+  backgroundRemovalProcessEvent,
+  backgroundRemovalUnloadEvent,
+} from '../../libs/inference/contract'
 
-// ---------------------------------------------------------------------------
-// Inference-specific input/output types
-// ---------------------------------------------------------------------------
-
-export interface BackgroundRemovalInput {
-  imageData: Uint8ClampedArray
-  width: number
-  height: number
-}
-
-export interface BackgroundRemovalOutput {
-  maskData: Uint8Array
-  width: number
-  height: number
-}
+const { context } = createContext()
 
 // ---------------------------------------------------------------------------
 // Model singleton
@@ -44,61 +31,9 @@ export interface BackgroundRemovalOutput {
 
 let model: PreTrainedModel | null = null
 let processor: Processor | null = null
+let resolvedDevice: InferenceDevice = 'webgpu'
 
 const MODEL_ID = MODEL_IDS.BG_REMOVAL
-
-function sendProgress(requestId: string, percent: number, message?: string): void {
-  const msg: ProgressResponse = {
-    type: 'progress',
-    requestId,
-    payload: {
-      phase: 'download',
-      percent,
-      message,
-    },
-  }
-  globalThis.postMessage(msg)
-}
-
-function sendError(requestId: string, error: unknown, phase?: 'load' | 'inference'): void {
-  const message = error instanceof Error ? error.message : String(error)
-  const code = classifyError(error, phase)
-  const msg: ErrorResponse = {
-    type: 'error',
-    requestId,
-    payload: {
-      code,
-      message,
-      recoverable: isRecoverable(code),
-    },
-  }
-  globalThis.postMessage(msg)
-}
-
-// NOTICE: Cancellation tracking — see Whisper worker for rationale.
-const cancelledRequestIds = new Set<string>()
-
-function markCancelled(targetRequestId: string): void {
-  cancelledRequestIds.add(targetRequestId)
-  const msg: ErrorResponse = {
-    type: 'error',
-    requestId: targetRequestId,
-    payload: {
-      code: 'CANCELLED',
-      message: 'Operation cancelled by caller',
-      recoverable: false,
-    },
-  }
-  globalThis.postMessage(msg)
-}
-
-function isCancelled(requestId: string): boolean {
-  return cancelledRequestIds.has(requestId)
-}
-
-function clearCancelled(requestId: string): void {
-  cancelledRequestIds.delete(requestId)
-}
 
 /**
  * Detect whether WebGPU is available inside the worker.
@@ -115,141 +50,74 @@ async function detectWebGPUInWorker(): Promise<boolean> {
   }
 }
 
-let resolvedDevice: 'webgpu' | 'wasm' | 'cpu' = 'webgpu'
-
-async function loadModel(request: LoadModelRequest): Promise<void> {
-  const { requestId } = request
-
-  try {
-    if (model && processor) {
-      if (isCancelled(requestId)) {
-        clearCancelled(requestId)
-        return
-      }
-      const ready: ModelReadyResponse = {
-        type: 'model-ready',
-        requestId,
-        modelId: MODEL_NAMES.BG_REMOVAL,
-        device: resolvedDevice,
-      }
-      globalThis.postMessage(ready)
-      return
-    }
-
-    // Auto-detect: if WebGPU was requested but unavailable, fall back to WASM
-    let device = request.device ?? 'webgpu'
-    if (device === 'webgpu') {
-      const hasWebGPU = await detectWebGPUInWorker()
-      if (!hasWebGPU) {
-        console.warn('[BG Removal Worker] WebGPU not available, falling back to WASM')
-        device = 'wasm'
-      }
-    }
-    resolvedDevice = device as 'webgpu' | 'wasm' | 'cpu'
-
-    env.backends.onnx.wasm!.proxy = false
-
-    model = await AutoModel.from_pretrained(MODEL_ID, {
-      device,
-      progress_callback: (progress: any) => {
-        sendProgress(requestId, progress?.progress ?? -1, progress?.status)
-      },
-    })
-
-    processor = await AutoProcessor.from_pretrained(MODEL_ID, {})
-
-    if (isCancelled(requestId)) {
-      clearCancelled(requestId)
-      return
-    }
-
-    const ready: ModelReadyResponse = {
-      type: 'model-ready',
-      requestId,
-      modelId: MODEL_NAMES.BG_REMOVAL,
-      device: resolvedDevice,
-    }
-    globalThis.postMessage(ready)
-  }
-  catch (error) {
-    if (isCancelled(requestId))
-      clearCancelled(requestId)
-    else
-      sendError(requestId, error, 'load')
-  }
-}
-
 // ---------------------------------------------------------------------------
-// Processing
+// Handlers
 // ---------------------------------------------------------------------------
 
-async function runInference(request: RunInferenceRequest<BackgroundRemovalInput>): Promise<void> {
-  const { requestId, input } = request
-  const { imageData, width, height } = input
-
-  try {
-    if (!model || !processor) {
-      throw new Error('Model not loaded. Send load-model first.')
-    }
-
-    // Create RawImage from the raw pixel data
-    const img = new RawImage(imageData, width, height, 4)
-
-    // Pre-process
-    const { pixel_values } = await processor(img)
-
-    // Run inference
-    const { output } = await model({ input: pixel_values })
-
-    // Extract mask and resize to original dimensions
-    const mask = await RawImage.fromTensor(
-      output[0].mul(255).to('uint8'),
-    ).resize(width, height)
-
-    if (isCancelled(requestId)) {
-      clearCancelled(requestId)
-      return
-    }
-
-    const maskData = new Uint8Array(mask.data.buffer)
-
-    const result: InferenceResultResponse<BackgroundRemovalOutput> = {
-      type: 'inference-result',
-      requestId,
-      output: { maskData, width, height },
-    }
-    // Transfer the buffer to avoid copying
-    ;(globalThis as any).postMessage(result, [maskData.buffer])
+defineStreamInvokeHandler(context, backgroundRemovalLoadEvent, toStreamHandler<LoadModelRequest, LoadStreamItem>(async ({ payload, emit }) => {
+  // Already loaded — short-circuit with the device we actually ran on.
+  if (model && processor) {
+    emit({ kind: 'ready', info: { device: resolvedDevice } })
+    return
   }
-  catch (error) {
-    if (isCancelled(requestId))
-      clearCancelled(requestId)
-    else
-      sendError(requestId, error, 'inference')
+
+  // Auto-detect: if WebGPU was requested but unavailable, fall back to WASM.
+  let device = payload.device ?? 'webgpu'
+  if (device === 'webgpu') {
+    const hasWebGPU = await detectWebGPUInWorker()
+    if (!hasWebGPU) {
+      console.warn('[BG Removal Worker] WebGPU not available, falling back to WASM')
+      device = 'wasm'
+    }
   }
-}
+  resolvedDevice = device
 
-// ---------------------------------------------------------------------------
-// Message handler
-// ---------------------------------------------------------------------------
+  env.backends.onnx.wasm!.proxy = false
 
-globalThis.addEventListener('message', async (event: MessageEvent<WorkerInboundMessage<BackgroundRemovalInput>>) => {
-  const message = event.data
+  model = await AutoModel.from_pretrained(MODEL_ID, {
+    device,
+    progress_callback: (progress: any) => {
+      emit({
+        kind: 'progress',
+        payload: {
+          phase: 'download',
+          percent: progress?.progress ?? -1,
+          message: progress?.status,
+        },
+      })
+    },
+  })
 
-  switch (message.type) {
-    case 'load-model':
-      await loadModel(message)
-      break
-    case 'run-inference':
-      await runInference(message as RunInferenceRequest<BackgroundRemovalInput>)
-      break
-    case 'unload-model':
-      model = null
-      processor = null
-      globalThis.postMessage({ type: 'model-unloaded', requestId: message.requestId })
-      break
-    case 'cancel':
-      markCancelled(message.targetRequestId)
-      break
-  }
+  processor = await AutoProcessor.from_pretrained(MODEL_ID, {})
+
+  emit({ kind: 'ready', info: { device: resolvedDevice } })
+}))
+
+defineInvokeHandler(context, backgroundRemovalProcessEvent, async ({ imageData, width, height }) => {
+  if (!model || !processor)
+    throw new Error('Model not loaded. Send load first.')
+
+  // Create RawImage from the raw pixel data
+  const img = new RawImage(imageData, width, height, 4)
+
+  // Pre-process
+  const { pixel_values } = await processor(img)
+
+  // Run inference
+  const { output } = await model({ input: pixel_values })
+
+  // Extract mask and resize to original dimensions
+  const mask = await RawImage.fromTensor(
+    output[0].mul(255).to('uint8'),
+  ).resize(width, height)
+
+  const maskData = new Uint8Array(mask.data.buffer)
+
+  // Transfer the mask buffer directly — avoids copying.
+  return withTransfer({ maskData, width, height }, [maskData.buffer])
+})
+
+defineInvokeHandler(context, backgroundRemovalUnloadEvent, () => {
+  model = null
+  processor = null
 })
