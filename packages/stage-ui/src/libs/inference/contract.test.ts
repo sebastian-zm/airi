@@ -1,15 +1,19 @@
-import type { LoadStreamItem, ModelReadyInfo } from './contract'
+import type { BackgroundRemovalRequest, BackgroundRemovalResult, LoadStreamItem, ModelReadyInfo, WhisperTranscribeItem } from './contract'
 import type { ProgressPayload } from './protocol'
 
 import { createContext, defineInvoke, defineInvokeHandler, defineStreamInvoke, defineStreamInvokeHandler } from '@moeru/eventa'
 import { describe, expect, it, vi } from 'vitest'
 
 import {
+  backgroundRemovalLoadEvent,
+  backgroundRemovalProcessEvent,
   consumeLoadStream,
   kokoroGenerateEvent,
   kokoroLoadEvent,
   kokoroUnloadEvent,
   signalWithTimeout,
+  whisperLoadEvent,
+  whisperTranscribeEvent,
 } from './contract'
 
 /** Build a one-shot `ReadableStream` from a fixed list of items. */
@@ -195,5 +199,105 @@ describe('kokoro event contract', () => {
     const unload = defineInvoke(ctx, kokoroUnloadEvent)
     await expect(unload(undefined)).resolves.toBeUndefined()
     expect(onUnload).toHaveBeenCalledTimes(1)
+  })
+})
+
+// Whisper load mirrors the shared load stream; transcribe is its own
+// server-streaming shape where per-token progress (carrying the worker's
+// `output` / `tps` / `numTokens` extras) precedes a terminal `result` item.
+describe('whisper event contract', () => {
+  it('should stream load progress then a ready signal that consumeLoadStream drains', async () => {
+    const ctx = createContext()
+
+    defineStreamInvokeHandler(ctx, whisperLoadEvent, async function* (request) {
+      yield { kind: 'progress', payload: { phase: 'download', percent: 0, message: 'Loading model...' } } satisfies LoadStreamItem
+      yield { kind: 'ready', info: { device: request.device } } satisfies LoadStreamItem
+    })
+
+    const invokeLoad = defineStreamInvoke(ctx, whisperLoadEvent)
+
+    const progressed: ProgressPayload[] = []
+    const info = await consumeLoadStream(
+      invokeLoad({ device: 'wasm' }),
+      p => progressed.push(p),
+    )
+
+    expect(progressed).toHaveLength(1)
+    expect(progressed[0].phase).toBe('download')
+    expect(progressed[0].message).toBe('Loading model...')
+    expect(info.device).toBe('wasm')
+  })
+
+  it('should stream per-token progress extras before the terminal result text', async () => {
+    const ctx = createContext()
+
+    defineStreamInvokeHandler(ctx, whisperTranscribeEvent, async function* (request) {
+      expect(request.language).toBe('en')
+      yield { kind: 'progress', payload: { phase: 'inference', percent: -1, numTokens: 1 } } satisfies WhisperTranscribeItem
+      yield { kind: 'progress', payload: { phase: 'inference', percent: -1, numTokens: 2, tps: 12.5 } } satisfies WhisperTranscribeItem
+      yield { kind: 'result', text: ['hello world'] } satisfies WhisperTranscribeItem
+    })
+
+    const transcribe = defineStreamInvoke(ctx, whisperTranscribeEvent)
+
+    const progressed: Array<ProgressPayload & Record<string, unknown>> = []
+    let text: string[] = []
+    for await (const item of transcribe({ audioFloat32: new Float32Array([0, 0.5, -0.5]), language: 'en' })) {
+      if (item.kind === 'progress')
+        progressed.push(item.payload)
+      else
+        text = item.text
+    }
+
+    expect(progressed).toHaveLength(2)
+    expect(progressed[0].numTokens).toBe(1)
+    expect(progressed[0].tps).toBeUndefined()
+    expect(progressed[1].numTokens).toBe(2)
+    expect(progressed[1].tps).toBe(12.5)
+    expect(text).toEqual(['hello world'])
+  })
+})
+
+describe('background removal event contract', () => {
+  it('should stream load progress then a ready signal that consumeLoadStream drains', async () => {
+    const ctx = createContext()
+
+    defineStreamInvokeHandler(ctx, backgroundRemovalLoadEvent, async function* (request) {
+      yield { kind: 'progress', payload: { phase: 'download', percent: 25 } } satisfies LoadStreamItem
+      yield { kind: 'ready', info: { device: request.device } } satisfies LoadStreamItem
+    })
+
+    const invokeLoad = defineStreamInvoke(ctx, backgroundRemovalLoadEvent)
+
+    const progressed: ProgressPayload[] = []
+    const info = await consumeLoadStream(invokeLoad({ device: 'webgpu' }), p => progressed.push(p))
+
+    expect(progressed).toHaveLength(1)
+    expect(progressed[0].percent).toBe(25)
+    expect(info.device).toBe('webgpu')
+  })
+
+  it('should round-trip a unary process request and its alpha mask result', async () => {
+    const ctx = createContext()
+
+    defineInvokeHandler(ctx, backgroundRemovalProcessEvent, ({ imageData, width, height }) => {
+      expect(width).toBe(2)
+      expect(height).toBe(1)
+      // Two RGBA pixels in, one alpha-mask byte per pixel out.
+      expect(Array.from(imageData)).toEqual([10, 20, 30, 255, 40, 50, 60, 255])
+      return { maskData: new Uint8Array([0, 255]), width, height } satisfies BackgroundRemovalResult
+    })
+
+    const process = defineInvoke(ctx, backgroundRemovalProcessEvent)
+    const request: BackgroundRemovalRequest = {
+      imageData: new Uint8ClampedArray([10, 20, 30, 255, 40, 50, 60, 255]),
+      width: 2,
+      height: 1,
+    }
+    const result = await process(request)
+
+    expect(Array.from(result.maskData)).toEqual([0, 255])
+    expect(result.width).toBe(2)
+    expect(result.height).toBe(1)
   })
 })
