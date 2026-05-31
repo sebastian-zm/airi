@@ -44,23 +44,6 @@ export {
 export type {
   ErrorPayload,
   InferenceErrorCode,
-  InferenceResultResponse,
-  LoadModelRequest,
-  ModelReadyResponse,
   ProgressPayload,
   ProgressPhase,
-  ProgressResponse,
-  RunInferenceRequest,
-  UnloadModelRequest,
-  WorkerInboundMessage,
-  WorkerOutboundMessage,
 } from './protocol'
-export {
-  createInferenceWorkerManager,
-} from './worker-manager'
-
-export type {
-  InferenceWorkerManager,
-  WorkerManagerOptions,
-  WorkerManagerState,
-} from './worker-manager'
