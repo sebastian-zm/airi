@@ -949,9 +949,14 @@ export const useProvidersStore = defineStore('providers', () => {
         listVoices: async (config) => {
           const provider = createUnElevenLabs((config.apiKey as string).trim(), (config.baseUrl as string).trim()) as VoiceProviderWithExtraOptions<UnElevenLabsOptions>
 
-          const voices = await listVoices({
-            ...provider.voice(),
-          })
+          // NOTICE:
+          // `listVoices` from unspeech@0.1.14 expects `fetch?: StringFetch` (input: string) but
+          // `provider.voice()` returns options with `fetch?: Fetch` (input: URL) from @xsai/shared.
+          // These types are incompatible, so we omit `fetch` to avoid the type mismatch.
+          // Root cause: unspeech/dist/index.d.mts line 537-541, @xsai/shared/dist/index.d.ts line 87.
+          // Can be removed when unspeech aligns its `StringFetch` type with @xsai/shared's `Fetch`.
+          const { fetch: _fetch, ...voiceOptions } = provider.voice()
+          const voices = await listVoices(voiceOptions)
 
           if (!voices || !Array.isArray(voices)) {
             return []
@@ -1054,9 +1059,9 @@ export const useProvidersStore = defineStore('providers', () => {
         listVoices: async (config) => {
           const provider = createUnDeepgram((config.apiKey as string).trim(), (config.baseUrl as string).trim()) as VoiceProviderWithExtraOptions<UnDeepgramOptions>
 
-          const voices = await listVoices({
-            ...provider.voice(),
-          })
+          // NOTICE: same StringFetch/Fetch mismatch as ElevenLabs above — omit `fetch` field.
+          const { fetch: _fetch, ...voiceOptions } = provider.voice()
+          const voices = await listVoices(voiceOptions)
 
           return voices.map((voice) => {
             return {
@@ -1120,9 +1125,9 @@ export const useProvidersStore = defineStore('providers', () => {
         listVoices: async (config) => {
           const provider = createUnMicrosoft((config.apiKey as string).trim(), (config.baseUrl as string).trim()) as VoiceProviderWithExtraOptions<UnMicrosoftOptions>
 
-          const voices = await listVoices({
-            ...provider.voice({ region: config.region as string }),
-          })
+          // NOTICE: same StringFetch/Fetch mismatch as ElevenLabs above — omit `fetch` field.
+          const { fetch: _fetch, ...voiceOptions } = provider.voice({ region: config.region as string })
+          const voices = await listVoices(voiceOptions)
 
           return voices.map((voice) => {
             return {
@@ -1266,9 +1271,9 @@ export const useProvidersStore = defineStore('providers', () => {
         listVoices: async (config) => {
           const provider = createUnAlibabaCloud((config.apiKey as string).trim(), (config.baseUrl as string).trim()) as VoiceProviderWithExtraOptions<UnAlibabaCloudOptions>
 
-          const voices = await listVoices({
-            ...provider.voice(),
-          })
+          // NOTICE: same StringFetch/Fetch mismatch as ElevenLabs above — omit `fetch` field.
+          const { fetch: _fetch, ...voiceOptions } = provider.voice()
+          const voices = await listVoices(voiceOptions)
 
           return voices.map((voice) => {
             return {
@@ -1341,9 +1346,9 @@ export const useProvidersStore = defineStore('providers', () => {
         listVoices: async (config) => {
           const provider = createUnVolcengine((config.apiKey as string).trim(), (config.baseUrl as string).trim()) as VoiceProviderWithExtraOptions<UnVolcengineOptions>
 
-          const voices = await listVoices({
-            ...provider.voice(),
-          })
+          // NOTICE: same StringFetch/Fetch mismatch as ElevenLabs above — omit `fetch` field.
+          const { fetch: _fetch, ...voiceOptions } = provider.voice()
+          const voices = await listVoices(voiceOptions)
 
           return voices.map((voice) => {
             return {
